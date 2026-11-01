@@ -15,7 +15,7 @@ records every call site, and the passes that wrap, name and join arguments read 
 ```kotlin
 // build.gradle.kts of the module to format
 plugins {
-    id("io.github.lutics.formatter") version "0.0.3"
+    id("io.github.lutics.formatter") version "0.0.4"
 }
 ```
 

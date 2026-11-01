@@ -5,7 +5,7 @@ plugins {
     id("com.gradle.plugin-publish") version "2.2.1"
 }
 
-version = "0.0.3"
+version = "0.0.4"
 
 // AGP's DSL API, compileOnly: android source roots are read from AGP's source sets
 repositories { google() }

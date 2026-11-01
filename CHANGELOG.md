@@ -3,6 +3,17 @@
 Published to the Gradle Plugin Portal as `io.github.lutics.formatter`. The repository keeps no history of these
 versions; each entry was reconstructed from that version's published artifacts.
 
+## 0.0.4 — 2026-11-02
+
+**`composable-order` reports only what moving the statement fixes without changing the composition.**
+
+- A statement that can leave the function — a return or throw outside a labeled lambda return, a guard included —
+  closes a section: the order starts over after it, and it is not reported itself.
+- A statement is not reported when it uses what an earlier out-of-order statement declares or assigns during
+  composition, directly or through the statements between them, or declares a name that statement uses. What an
+  effect's lambdas and a local fun's body assign does not count.
+- A statement-level assignment (`state = rememberX(…)` into a `lateinit` local) is a value, not content.
+
 ## 0.0.3 — 2026-10-29
 
 **Formats the files around the Kotlin sources.** `format` and `check` now also take the module's `build.gradle.kts`;
