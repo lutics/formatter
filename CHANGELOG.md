@@ -3,6 +3,53 @@
 Published to the Gradle Plugin Portal as `io.github.lutics.formatter`. The repository keeps no history of these
 versions; each entry was reconstructed from that version's published artifacts.
 
+## 0.0.5 — 2026-11-14
+
+**Three reports become rewrites, each only where it keeps what the code does; what each relies on is stated with it.**
+
+- `mixed-condition-operators`: an `&&` inside an `||` gets parentheses (`a || b && c` → `a || (b && c)`,
+  `a && b || c` → `(a && b) || c`), the grouping Kotlin already applies; nested and multi-line conditions included. It
+  no longer reports anything; before format, check lists one finding per outermost group.
+- `ui-state-order` on a `when` without subject: an unbroken run of branches that each test one distinct member against
+  the same local `val` or parameter (`s is T.M`, or `s == T.M` with `M` an object, alone or followed by `&& guard`) is
+  reordered; the branches around the run stay where they are. A `when` whose runs cannot put it in order (another
+  branch between, a call, property, `var`, delegated `val` or `it` as subject, a member tested twice, a member that is
+  not final or declares `equals`, a `==` on a member that is not an object) is left whole and still reported, with the
+  reason. A `==` branch, with a subject or without, also needs every member of the type final (a subclass of an open
+  one, named by no branch, could bring an `equals` that matches), a subject whose declared type, where the code
+  declares one, is the UiState, and objects whose first use runs no code (no `init` block or property initializer, no
+  sealed-class constructor that runs code): the order decides which objects get compared. A branch or member that
+  shares its line with other code is not moved, and such a `when` is reported. Not seen: a subject whose type is
+  inferred (or a property's) as wider than the UiState, holding another class whose `equals` matches a member.
+- `composable-order`: a CompositionLocal read alone (`val activity = LocalActivity.current`) after other statements
+  moves up to its section's reads, with the comment lines right above it and in its order among the reads it moves.
+  Reading a CompositionLocal runs none of the code around it and nothing in the body can change what it reads, so it
+  may run before the statements it crosses. It stays, and is still reported, when it would cross a read that stays and
+  uses its name, when the function declares the `Local…` name itself or the file declares it as a `var`, or when it or
+  the statement it lands above shares a line with another statement. The move trusts the name: `LocalX` is a
+  CompositionLocal declared as a `val` outside the function (a `var` in another file is not seen); where nothing
+  provides it, its default runs (or throws) before the crossed statements. Every other
+  read out of order (Koin injection, collected state, `requireNotNull(LocalActivity.current)`, a selector after
+  `.current`), and a derived value or content out of order, is still reported only: it runs code (a constructor, a
+  flow's initial value, a check that throws) whose effect on the statements it would cross no name analysis can see.
+- `composable-order` also counts a `return` labeled with the composable's own name (`return@MainScreen`,
+  `?: return@MainScreen`) as leaving the function, so it closes a section like an unlabeled one, and a local class as
+  a declaration, so a read that names one declared after the reads is in its place.
+
+Still report-only, since a fix needs a name or an intent only the author has: `condition-call-spans-lines` where a hoist
+would change when the call runs, the multi-line call the record cannot map, `manifest-sections`,
+`version-catalog-names` and `sql-keyword-case`.
+
+**Build**
+
+- Gradle wrapper 9.9.1; `com.android.tools.build:gradle-api` 9.5.1 (from 9.4.1); `com.gradle.plugin-publish` stays
+  2.2.1 and Kotlin 2.4.21, the latest stable of each.
+- The engine has a test source set (JUnit Jupiter 6.1.3) with before/after and must-stay-reported cases for each
+  rewrite above; `./gradlew build` runs it.
+- `settings.gradle.kts` applies the foojay toolchain resolver (1.0.0), so `jvmToolchain(21)` builds on a machine
+  without a JDK 21. The bytecode stays at 21, so a consuming build runs Gradle on JDK 21 or newer (Gradle 9 and AGP 9
+  themselves run on 17): Gradle loads the plugin into that build's own JVM.
+
 ## 0.0.4 — 2026-11-02
 
 **`composable-order` reports only what moving the statement fixes without changing the composition.**

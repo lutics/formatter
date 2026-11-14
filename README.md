@@ -15,7 +15,7 @@ records every call site, and the passes that wrap, name and join arguments read 
 ```kotlin
 // build.gradle.kts of the module to format
 plugins {
-    id("io.github.lutics.formatter") version "0.0.4"
+    id("io.github.lutics.formatter") version "0.0.5"
 }
 ```
 
@@ -31,6 +31,7 @@ plugins {
 - The module's Kotlin version must equal the plugin's (2.4.21): the call recorder uses the K2 compiler's FIR checker
   API, which is not stable across compiler releases.
 - An Android application module (AGP) or a Kotlin JVM module.
+- Gradle running on JDK 21 or newer: the plugin's bytecode targets 21, and Gradle loads it into the build's own JVM.
 
 ## The standard
 
@@ -74,10 +75,73 @@ The examples show the result of `format`.
 
 - **When any branch of an `if` spans lines, every branch of that `if`/`else if`/`else` chain gets braces.** Multi-line
   `if` expressions and loops get braces too.
+- **An `&&` inside an `||` gets parentheses**, spelling out the grouping Kotlin already applies (`&&` binds tighter), so
+  nothing about what runs or when changes, nested and multi-line conditions included:
+  ```kotlin
+  if (e is ContentConvertException || (e is ClientRequestException && e.response.status.value !in setOf(401, 403)))
+  val visible = (loaded && !empty) || refreshing
+  ```
+- A call that spans lines inside an `if` condition moves to a `val` above the `if`, only where the `if` is a statement
+  and the call is its whole condition (or its negation), so the `val` runs exactly when the condition did.
 - A lambda that declares parameters (`a ->`, `(a, b) ->`) starts its body on the line after `->` and closes with `}` on
   its own line.
 - Lambda parameters stay on the `{` line; a redundant `->` is removed.
 - No blank line between `when` entries, even after a multi-line one.
+
+### UiState
+
+- **A sealed `*UiState` lists its members Initial → Loading → Empty → Success → Error, and a `when` over one tests them
+  in that order.** A member with another name (`SignedOut`) keeps its place; only the canonical ones move, among the
+  positions they hold. A `when` is reordered only where the order cannot decide which branch runs, judged from the
+  type's declaration among the module's files: every member it tests is final and extends no other member.
+- A branch that compares with `==` (`s == T.Member`, or `T.Member ->` with a subject) calls the subject's `equals` and
+  first uses the object. With one, every member of the type must be final (a subclass of an open one could bring its
+  own `equals`) with no `equals` but the generated one; the subject's type, where the code declares it, must be the
+  UiState (not `Any`); and neither an object compared nor a sealed class's constructor may run code when first used
+  (an `init` block, a property initializer), since the order decides which objects get compared.
+- With a subject (`when (state)`), every branch must test one distinct member (`is T.Member` or `T.Member`).
+- Without a subject, a run of adjacent branches is reordered when each tests one distinct member against the same local
+  `val` or parameter (never a call, a property, a `var` or a delegated `val`), as `s is T.Member` or `s == T.Member`
+  (an `object`), alone or followed by `&& guard`. At most one member test of the run can hold and a guard runs only
+  after its own test held, so the same branch runs in any order. Every other branch keeps its place, and a run never
+  extends past one:
+  ```kotlin
+  when {
+      !booted -> Unit
+      uiState == null -> Unit
+      uiState == UserUiState.Loading -> wait()
+      uiState is UserUiState.Success && uiState.user.banned -> block()
+      uiState == UserUiState.Error -> finish()
+      else -> unlock()
+  }
+  ```
+- A branch or member that shares its line with other code is never moved.
+
+### Composable bodies
+
+- **A Unit-returning `@Composable` body opens with a blank line, puts its reads (CompositionLocals, collected state,
+  Koin injection) first, one per line with no blank line between them, and one blank line around every other
+  statement.** Then come derived values, effects, content, and the effects the content drives.
+- A CompositionLocal read alone (`val activity = LocalActivity.current`) that comes after other statements moves up to
+  the reads, with the comment lines right above it. Reading a CompositionLocal runs none of the code around it, and no
+  statement of the body can change what it reads (only an enclosing provider sets it), so it may run before them. It
+  stays, and is reported, when it would cross a read that stays and that uses its name, when the function itself
+  declares the `Local…` name or the file declares it as a `var`, or when it or the statement it lands above shares a
+  line with another statement. A
+  `return` or `throw` (a guard such as `if (locked == null) return`, or `?: return@MainScreen`) starts the order over
+  below it, and nothing moves across it.
+  ```kotlin
+  @Composable
+  fun MainScreen() {
+
+      // the activity the screen finishes
+      val activity = LocalActivity.current
+
+      val backStack = rememberNavBackStack(AppRoute.Splash())
+  ```
+- The move trusts the name: `LocalX` is a CompositionLocal, declared as a `val` outside the function (a `var` in
+  another file is not seen). Where nothing provides it, its default runs (or throws) before the statements the read
+  crossed instead of after them.
 
 ### Comments
 
@@ -135,10 +199,28 @@ these files alone runs only those rules, over them: `*.kts` takes the Kotlin rul
 
 ### Reported, not rewritten
 
-`check` lists these for a person to fix, because only the author knows the intent:
+`check` lists these for a person to fix, because fixing them needs a name or an intent only the author has, or a move
+the formatter cannot prove keeps what the code does:
 
-- `a && b || c` without parentheses (mixed-condition-operators).
+- A call that spans lines inside a condition where hoisting it to a `val` would change when or whether it runs: a loop
+  condition, a `when` subject, inside `&&`/`||` or a lambda, an else-if, a brace-less branch, an expression-position
+  `if`, a comment in the condition, a generic callee whose type comes from the condition, or a call no plain name fits
+  (condition-call-spans-lines). The `val` needs a name and the call's place needs the author.
 - A multi-line Kotlin call whose arguments the compiler record cannot map to parameters.
+- A `when` over a UiState out of order that the rules under 「UiState」 do not allow to reorder (ui-state-order): a
+  subject that is a call, a property, a `var`, a delegated `val` or `it`; two branches on the same member; a branch
+  between that tests something else (`log() ->`, `x == null ->`, another type) or an `||`; a member that is open,
+  extends another, declares its own `equals`, or that the module does not declare; with `==`, a subject declared wider
+  than the UiState or an object whose first use runs code; a branch sharing its line with other code. The finding
+  names the reason.
+- In a `@Composable` body (composable-order): a read other than a CompositionLocal read alone (Koin injection,
+  collected state, `requireNotNull(LocalActivity.current)`, `LocalConfiguration.current.screenWidthDp`), which runs
+  code whose effects on the statements it would cross the formatter cannot see; a CompositionLocal read that would
+  cross a read that stays and uses its name, whose `Local…` name the function declares or the file has as a `var`, or
+  that shares its line with another statement; a derived value after an effect or content; content after an effect
+  that follows the content. A derived value or content would cross effects and content whose composition the formatter
+  cannot see into, so it is never moved. A read that uses what a statement above it declares or assigns, or declares a
+  name one of them uses, is in its place and not reported.
 - A manifest whose `<application>` holds an element no section names, or a comment a blank line separates from every
   element (manifest-sections); its sections are then left as they are. Also a comment right under a header and right
   above an element that is not the first of that header's section: it may introduce the section or explain the element.
@@ -178,7 +260,7 @@ file's line count.
 
 | Module | |
 |---|---|
-| `engine` | The passes and formatter rules, on the Kotlin compiler's PSI, and the text rules for the other files (`Files.kt`). Also a command-line `formatter` for running one step (`--step`). |
+| `engine` | The passes and formatter rules, on the Kotlin compiler's PSI, and the text rules for the other files (`Files.kt`). Also a command-line `formatter` for running one step (`--step`). Its before/after cases (`src/test`, JUnit Jupiter) run in `./gradlew build`. |
 | `compiler-plugin` | The call recorder (K2). |
 | `gradle-plugin` | The `format` task and the check behind `check`; runs the engine in an isolated worker classloader. |
 

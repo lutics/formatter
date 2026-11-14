@@ -12,11 +12,15 @@ import org.jetbrains.kotlin.psi.KtArrayAccessExpression
 import org.jetbrains.kotlin.psi.KtBinaryExpression
 import org.jetbrains.kotlin.psi.KtBlockExpression
 import org.jetbrains.kotlin.psi.KtCallExpression
+import org.jetbrains.kotlin.psi.KtClassOrObject
 import org.jetbrains.kotlin.psi.KtDestructuringDeclaration
+import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtIfExpression
 import org.jetbrains.kotlin.psi.KtLabelReferenceExpression
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
+import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtOperationReferenceExpression
 import org.jetbrains.kotlin.psi.KtProperty
@@ -29,7 +33,7 @@ import org.jetbrains.kotlin.psi.KtValueArgumentName
 
 // A Unit-returning @Composable body opens with a blank line, keeps its reads (CompositionLocals, collected state,
 // injection) together, and puts one blank line around every other statement. Only blank lines change: the order is
-// reported by composable-order, because moving a statement can change what the composition does.
+// composable-order's.
 object ComposableBlankLines : Rule {
     override val id = "composable-blank-lines"
 
@@ -67,83 +71,147 @@ object ComposableBlankLines : Rule {
     private fun KtExpression.isAnnotatedDeclaration() = this is KtProperty && annotationEntries.isNotEmpty()
 }
 
-// reads → derived values → effects → content → the effects the content drives. One finding per statement out of order.
-// A statement is reported only when moving it fixes it without changing what the composition does:
-// - a statement that can leave the function (a return or throw outside a labeled lambda return, a guard included)
-//   decides whether everything after it runs, so nothing may cross it: it closes a section, the order starts over
-//   after it, and it is never reported itself;
+// reads → derived values → effects → content → the effects the content drives. A statement out of order is one that
+// moving fixes without changing what the composition does:
+// - a statement that can leave the function (a return or throw, a guard included; a return labeled with a lambda's
+//   name leaves only that lambda, one labeled with the function's own name leaves the function) decides whether
+//   everything after it runs, so nothing may cross it: it closes a section, the order starts over after it, and it is
+//   never out of order itself;
 // - a statement that uses what an earlier out-of-order statement declares or assigns during composition, directly or
 //   through the statements between them, cannot move above it (`val vm = if (booted) koinViewModel() else null`
 //   then `vm?.uiState?.collectAsStateWithLifecycle()`), and neither can one that declares a name that statement uses,
 //   which would shadow it. An effect's lambdas and a local fun's body run later, so what they assign does not count.
+// format moves only a CompositionLocal read alone (`val x = LocalX.current`, LocalX neither a name the function
+// declares nor a var of the file): reading a CompositionLocal runs none of the code around it and changes nothing, and no statement of the body
+// can change what it reads (only an enclosing provider sets it), so it may run before the statements it crosses, a
+// statement that throws included. It moves up to the end of its section's leading reads, with the comments that travel
+// with it (travellingSpan), keeping the reads it moves in their order, unless it would cross a read that stays and that
+// it depends on (by name, as above), or it or the statement it lands above shares a line with another statement. Every
+// other statement out of order is reported, never moved: injection runs a constructor, collected state evaluates its
+// receiver and initial value and starts a collection, a CompositionLocal read wrapped in a call or chained runs that
+// code, and a derived value or content crosses effects and content; none of that code is visible to a name analysis
+// (a call may change a global, or the receiver of a call made without one).
+// The move trusts the name: LocalX is a CompositionLocal, declared as a val outside the function (a var of another file
+// that a crossed call reassigns is not seen). Where nothing provides it, its default factory runs (or throws) before
+// the crossed statements instead of after them.
 object ComposableOrder : Rule {
     override val id = "composable-order"
 
-    override fun findings(file: KtFile): List<Finding> =
-        composableBodies(file).flatMap { body ->
-            val name = (body.parent as KtNamedFunction).name
-            var seenNonRead: Kind? = null
-            var seenEffect = false
-            var seenContent = false
-            var seenLateEffect = false
-            // the section so far: each statement's kind, its dependencies on earlier ones (closed transitively), and
-            // what makes the current statement out of order
-            val kinds = mutableListOf<Kind>()
-            val uses = mutableListOf<Set<String>>()
-            val defines = mutableListOf<Set<String>>()
-            val deps = mutableListOf<Set<Int>>()
-            body.statements.mapNotNull { statement ->
-                val kind = statement.kind()
-                if (kind != Kind.LOCAL_FUN && statement.exits()) {
-                    seenNonRead = null
-                    seenEffect = false
-                    seenContent = false
-                    seenLateEffect = false
-                    kinds.clear()
-                    uses.clear()
-                    defines.clear()
-                    deps.clear()
-                    return@mapNotNull null
-                }
-                val used = statement.usedNames()
-                val declared = statement.declaredNames()
-                val defined = declared + if (kind == Kind.EFFECT || kind == Kind.LOCAL_FUN) emptySet() else statement.assignedNames()
-                val direct = kinds.indices.filter { j -> (used intersect defines[j]).isNotEmpty() || (uses[j] intersect declared).isNotEmpty() }
-                val dependsOn = direct.toSet() + direct.flatMap { deps[it] }
-                // the earlier statements this one would have to move above
-                val offenders = kinds.indices.filter { j ->
-                    when (kind) {
-                        Kind.READ -> kinds[j] != Kind.READ
-                        Kind.DERIVED -> kinds[j] == Kind.EFFECT || kinds[j] == Kind.CONTENT
-                        Kind.CONTENT -> kinds[j] == Kind.EFFECT && kinds.subList(0, j).contains(Kind.CONTENT)
-                        else -> false
-                    }
-                }
-                val movable = offenders.none { it in dependsOn }
-                val detail = if (!movable) {
-                    null
-                } else {
-                    when (kind) {
-                        Kind.READ -> seenNonRead?.let { "A read (CompositionLocal, collected state, injection) after ${it.label()} in $name: reads come first." }
-                        Kind.DERIVED -> if (seenEffect || seenContent) "A derived value after ${if (seenContent) "content" else "an effect"} in $name: values come before effects and content." else null
-                        Kind.CONTENT -> if (seenLateEffect) "Content after an effect that follows the content in $name: only the effects the content drives come after it." else null
-                        else -> null
-                    }
-                }
-                if (kind != Kind.READ) seenNonRead = kind
-                when (kind) {
-                    Kind.EFFECT -> if (seenContent) seenLateEffect = true else seenEffect = true
-                    Kind.CONTENT -> seenContent = true
-                    else -> Unit
-                }
-                kinds += kind
-                uses += used
-                defines += defined
-                deps += dependsOn
-                // A comment bound to a declaration starts its text range, so the finding points at the first code leaf
-                detail?.let { Finding(statement.firstCodeLeaf().textRange.startOffset, it) }
+    override fun edits(file: KtFile): List<Edit> = composableBodies(file).flatMap { analyse(it).first }
+
+    override fun findings(file: KtFile): List<Finding> = composableBodies(file).flatMap { analyse(it).second }
+
+    // One statement of a section: the names it uses, the earlier statements it depends on (closed transitively), and why
+    // it is out of order (null when it is not).
+    private class Entry(val statement: KtExpression, val kind: Kind, val used: Set<String>, val dependsOn: Set<Int>, val detail: String?)
+
+    // The moves as edits, and a finding for every statement out of order that is not moved.
+    private fun analyse(body: KtBlockExpression): Pair<List<Edit>, List<Finding>> {
+        val function = body.parent as KtNamedFunction
+        val name = function.name
+        // the names that are not a CompositionLocal here: every name the function declares (its parameters and nested
+        // declarations included), and every var of the file (a class's or a top-level one), which a crossed call may
+        // reassign
+        val notLocals = function.descendants<KtNamedDeclaration>().mapNotNull { it.name }.toSet() +
+            function.containingKtFile.descendants<KtProperty>().filter { it.isVar }.mapNotNull { it.name }
+        val edits = mutableListOf<Edit>()
+        val findings = mutableListOf<Finding>()
+        var seenNonRead: Kind? = null
+        var seenEffect = false
+        var seenContent = false
+        var seenLateEffect = false
+        val section = mutableListOf<Entry>()
+        val defines = mutableListOf<Set<String>>()
+        for (statement in body.statements) {
+            val kind = statement.kind()
+            if (kind != Kind.LOCAL_FUN && statement.exits(name)) {
+                closeSection(section, notLocals, edits, findings)
+                seenNonRead = null
+                seenEffect = false
+                seenContent = false
+                seenLateEffect = false
+                section.clear()
+                defines.clear()
+                continue
             }
+            val used = statement.usedNames()
+            val declared = statement.declaredNames()
+            val defined = declared + if (kind == Kind.EFFECT || kind == Kind.LOCAL_FUN) emptySet() else statement.assignedNames()
+            val direct = section.indices.filter { j -> (used intersect defines[j]).isNotEmpty() || (section[j].used intersect declared).isNotEmpty() }
+            val dependsOn = direct.toSet() + direct.flatMap { section[it].dependsOn }
+            // the earlier statements this one would have to move above
+            val offenders = section.indices.filter { j ->
+                val other = section[j].kind
+                when (kind) {
+                    Kind.READ -> other != Kind.READ
+                    Kind.DERIVED -> other == Kind.EFFECT || other == Kind.CONTENT
+                    Kind.CONTENT -> other == Kind.EFFECT && section.subList(0, j).any { it.kind == Kind.CONTENT }
+                    else -> false
+                }
+            }
+            val movable = offenders.none { it in dependsOn }
+            val detail = if (!movable) {
+                null
+            } else {
+                when (kind) {
+                    Kind.READ -> seenNonRead?.let { "A read (CompositionLocal, collected state, injection) after ${it.label()} in $name: reads come first." }
+                    Kind.DERIVED -> if (seenEffect || seenContent) "A derived value after ${if (seenContent) "content" else "an effect"} in $name: values come before effects and content." else null
+                    Kind.CONTENT -> if (seenLateEffect) "Content after an effect that follows the content in $name: only the effects the content drives come after it." else null
+                    else -> null
+                }
+            }
+            if (kind != Kind.READ) seenNonRead = kind
+            when (kind) {
+                Kind.EFFECT -> if (seenContent) seenLateEffect = true else seenEffect = true
+                Kind.CONTENT -> seenContent = true
+                else -> Unit
+            }
+            section += Entry(statement, kind, used, dependsOn, detail)
+            defines += defined
         }
+        closeSection(section, notLocals, edits, findings)
+        return edits to findings
+    }
+
+    // Moves the section's CompositionLocal reads that are out of order up to the end of its leading reads, in their order,
+    // and reports every other statement out of order.
+    private fun closeSection(section: List<Entry>, notLocals: Set<String>, edits: MutableList<Edit>, findings: MutableList<Finding>) {
+        val leading = section.indexOfFirst { it.kind != Kind.READ }.takeIf { it >= 0 } ?: return
+        // the section's order as the moves so far leave it; the moved reads sit at [leading, end)
+        val order = section.indices.toMutableList()
+        var end = leading
+        val moved = mutableListOf<Entry>()
+        for ((i, entry) in section.withIndex()) {
+            entry.detail ?: continue
+            val safe = entry.statement.isCompositionLocalRead(notLocals) &&
+                // a crossed statement it depends on can only be a read that stays: any other makes it not out of order
+                order.subList(end, order.indexOf(i)).none { it in entry.dependsOn } &&
+                entry.statement.ownsLines() && section[leading].statement.ownsLines()
+            if (!safe) {
+                // A comment bound to a declaration starts its text range, so the finding points at the first code leaf
+                findings += Finding(entry.statement.firstCodeLeaf().textRange.startOffset, entry.detail)
+                continue
+            }
+            order.remove(i)
+            order.add(end, i)
+            end++
+            moved += entry
+        }
+        if (moved.isEmpty()) return
+        val target = section[leading].statement
+        val indent = target.lineIndent()
+        val text = target.containingFile.text
+        val at = target.travellingSpan().startOffset
+        edits += Edit(at, at, moved.joinToString(separator = "") { it.statement.travellingSpan().substring(text) + "\n" + indent })
+        for (entry in moved) {
+            val span = entry.statement.travellingSpan()
+            // the read's lines go, from the start of its first line through the line break after it, so the finding check
+            // reports for this edit points at the read
+            val lineStart = text.lastIndexOf('\n', span.startOffset - 1) + 1
+            val lineEnd = text.indexOf('\n', span.endOffset).takeIf { it >= 0 }?.plus(1) ?: text.length
+            edits += Edit(lineStart, lineEnd, "")
+        }
+    }
 
     private fun Kind.label() = when (this) {
         Kind.DERIVED -> "a derived value"
@@ -162,6 +230,8 @@ private val COLLECTORS = setOf("collectAsState", "collectAsStateWithLifecycle", 
 private val INJECTORS = setOf("koinInject", "koinViewModel")
 
 private val COMPOSITION_LOCAL = Regex("""^Local[A-Z]\w*\s*\.\s*current\b""")
+
+private val LOCAL_NAME = Regex("""Local[A-Z]\w*""")
 
 private val HANDLERS = setOf("BackHandler", "PredictiveBackHandler")
 
@@ -197,6 +267,18 @@ private fun KtCallExpression.keyedStatement(): KtExpression? {
 }
 
 private fun KtProperty.isRead(): Boolean = (delegateExpression ?: initializer)?.isReadValue() ?: false
+
+// `val x = LocalX.current` (or `var`, with a type or not) and nothing else, LocalX not one of notLocals (the function's own
+// names and the file's vars), so it names a CompositionLocal declared as a val outside the function. A delegate, a call
+// around it or a selector after it runs code the read alone does not.
+private fun KtExpression.isCompositionLocalRead(notLocals: Set<String>): Boolean {
+    val property = this as? KtProperty ?: return false
+    if (property.hasDelegate()) return false
+    val value = property.initializer as? KtDotQualifiedExpression ?: return false
+    val local = (value.receiverExpression as? KtNameReferenceExpression)?.getReferencedName() ?: return false
+    val selector = (value.selectorExpression as? KtNameReferenceExpression)?.getReferencedName()
+    return selector == "current" && LOCAL_NAME.matches(local) && local !in notLocals
+}
 
 private fun KtExpression.isReadValue(): Boolean {
     val callee = (this as? KtCallExpression)?.calleeExpression?.text
@@ -236,10 +318,12 @@ private fun KtExpression.usedNames(): Set<String> =
         .map { it.getReferencedName() }
         .toSet()
 
+// A local class counts: a later statement that names it means that class, not one declared outside the function.
 private fun KtExpression.declaredNames(): Set<String> = when (this) {
     is KtProperty -> setOfNotNull(name)
     is KtDestructuringDeclaration -> entries.mapNotNull { it.name }.toSet()
     is KtNamedFunction -> setOfNotNull(name)
+    is KtClassOrObject -> setOfNotNull(name)
     else -> emptySet()
 }
 
@@ -258,6 +342,8 @@ private fun KtExpression.assignedNames(): Set<String> {
     return (assignments + increments).toSet()
 }
 
-// An unlabeled return leaves the function, from an inline lambda too; a labeled one leaves only its lambda
-private fun KtExpression.exits(): Boolean =
-    descendants<KtReturnExpression>().any { it.getTargetLabel() == null } || descendants<KtThrowExpression>().isNotEmpty()
+// An unlabeled return leaves the function, from an inline lambda too, and so does one labeled with the function's own name
+// (`return@MainScreen`, `?: return@MainScreen`); one labeled with a lambda's name leaves only that lambda.
+private fun KtExpression.exits(function: String?): Boolean =
+    descendants<KtReturnExpression>().any { it.getLabelName().let { label -> label == null || label == function } } ||
+        descendants<KtThrowExpression>().isNotEmpty()

@@ -5,7 +5,7 @@ plugins {
     id("com.gradle.plugin-publish") version "2.2.1"
 }
 
-version = "0.0.4"
+version = "0.0.5"
 
 // AGP's DSL API, compileOnly: android source roots are read from AGP's source sets
 repositories { google() }
@@ -34,7 +34,7 @@ val engineRuntime = configurations.resolvable("engineRuntime") {
 dependencies {
     compileOnly(project(":engine"))
     compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.21")
-    compileOnly("com.android.tools.build:gradle-api:9.4.1")
+    compileOnly("com.android.tools.build:gradle-api:9.5.1")
     add("bundledJars", project(":engine"))
     add("bundledJars", project(":compiler-plugin"))
     add("engineJar", project(":engine"))
@@ -44,7 +44,9 @@ dependencies {
 samWithReceiver { annotation("org.gradle.api.HasImplicitReceiver") }
 
 kotlin {
-    // Gradle runs android builds on JDK 21, and loads this plugin there
+    // Gradle loads this plugin into the consuming build's own JVM, so the bytecode level is the oldest JDK a
+    // consuming build can run Gradle on to use the plugin. 21 is this project's choice, not a Gradle or AGP limit: both
+    // run on 17.
     jvmToolchain(21)
     // lambdas as classes, as kotlin-dsl compiles them: the configuration cache cannot store an invokedynamic lambda
     compilerOptions { freeCompilerArgs.addAll("-Xlambdas=class", "-Xsam-conversions=class") }
